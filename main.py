@@ -1,63 +1,102 @@
 import os
-from github import Github
-from crewai import Agent, Task, Crew
+
+from crewai import Agent, Crew, Task
 from crewai.tools import tool
+from github import Github, GithubException
 from langchain_openai import ChatOpenAI
+
 from server import send_approval_to_slack
-from dotenv import load_dotenv
 
-load_dotenv()
 
-gh = Github(os.getenv("GITHUB_TOKEN"))
+def _required_environment(*names: str) -> None:
+    missing = [name for name in names if not os.getenv(name)]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
 
 @tool("Fetch GitHub Issues")
 def fetch_github_issues(repo_name: str) -> str:
-    """Fetch open issues from a specific GitHub repository."""
+    """Fetch up to five open issues from a GitHub repository."""
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN is not configured.")
+
     try:
-        repo = gh.get_repo(repo_name)
-        issues = repo.get_issues(state='open')
-        result = [f"- Issue #{i.number}: {i.title}" for i in issues[:5]]
-        return f"Open Issues for {repo_name}:\n" + "\n".join(result) if result else "No open issues found."
-    except Exception as e:
-        return f"Error: {str(e)}"
+        repository = Github(token).get_repo(repo_name)
+        issues = []
+        for issue in repository.get_issues(state="open"):
+            if issue.pull_request is None:
+                issues.append(f"- Issue #{issue.number}: {issue.title}")
+                if len(issues) == 5:
+                    break
+    except GithubException as exc:
+        return f"Unable to fetch issues for {repo_name}: {exc.data}"
+
+    if not issues:
+        return f"No open issues found for {repo_name}."
+    return f"Open issues for {repo_name}:\n" + "\n".join(issues)
+
 
 @tool("Send Draft for Approval")
 def trigger_slack_approval(draft_text: str) -> str:
-    """Sends the drafted post to Slack for approval."""
+    """Send a drafted LinkedIn post to Slack for approval."""
     send_approval_to_slack(draft_text)
-    return "Sent draft to Slack."
+    return "Draft sent to Slack for approval."
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
 
-github_researcher = Agent(
-    role="GitHub Technical Analyst",
-    goal="Extract technical updates from GitHub repositories.",
-    backstory="You analyze repository activity and extract key bug updates or features.",
-    tools=[fetch_github_issues],
-    llm=llm
-)
+def run_agent(repo_name: str) -> str:
+    """Analyze a repository, draft a LinkedIn post, and request Slack approval."""
+    _required_environment(
+        "OPENAI_API_KEY",
+        "GITHUB_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "SLACK_CHANNEL_ID",
+        "SLACK_SIGNING_SECRET",
+        "LINKEDIN_ACCESS_TOKEN",
+        "LINKEDIN_PERSON_URN",
+    )
 
-copywriter = Agent(
-    role="Tech Copywriter",
-    goal="Draft engaging LinkedIn updates and dispatch them to Slack for sign-off.",
-    backstory="You turn technical updates into readable, high-performing tech social posts.",
-    tools=[trigger_slack_approval],
-    llm=llm
-)
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+    github_researcher = Agent(
+        role="GitHub Technical Analyst",
+        goal="Extract accurate technical updates from open GitHub issues.",
+        backstory="You analyze repository issues and summarize only verifiable details.",
+        tools=[fetch_github_issues],
+        llm=llm,
+    )
+    copywriter = Agent(
+        role="Tech Copywriter",
+        goal="Draft a factual LinkedIn update and send it to Slack for approval.",
+        backstory="You turn technical updates into clear, engaging social posts without inventing facts.",
+        tools=[trigger_slack_approval],
+        llm=llm,
+    )
 
-task1 = Task(
-    description="Analyze open issues and activity for repository: {repo_name}.",
-    expected_output="Summary of issues and features.",
-    agent=github_researcher
-)
+    research_task = Task(
+        description=(
+            "Analyze the open issues for the GitHub repository {repo_name}. "
+            "Use the GitHub tool and report only information returned by it."
+        ),
+        expected_output="A concise, factual summary of the repository's open issues.",
+        agent=github_researcher,
+    )
+    approval_task = Task(
+        description=(
+            "Using only the research summary, draft a concise LinkedIn post. "
+            "Do not invent repository updates or claim issues are fixed. "
+            "You must send the draft to Slack with the approval tool."
+        ),
+        expected_output="Confirmation that the draft was sent to Slack for approval.",
+        agent=copywriter,
+        context=[research_task],
+    )
 
-task2 = Task(
-    description="Draft a LinkedIn post based on the summary and send it to Slack for approval.",
-    expected_output="Confirmation of dispatch to Slack.",
-    agent=copywriter
-)
+    result = Crew(
+        agents=[github_researcher, copywriter],
+        tasks=[research_task, approval_task],
+    ).kickoff(inputs={"repo_name": repo_name})
+    return str(result)
 
-crew = Crew(agents=[github_researcher, copywriter], tasks=[task1, task2])
 
 if __name__ == "__main__":
-    crew.kickoff(inputs={"repo_name": "octocat/Hello-World"})
+    print(run_agent("octocat/Hello-World"))
