@@ -1,0 +1,8 @@
+crewai
+langchain-openai
+pygithub
+fastapi
+uvicorn
+requests
+slack_sdk
+python-dotenv
